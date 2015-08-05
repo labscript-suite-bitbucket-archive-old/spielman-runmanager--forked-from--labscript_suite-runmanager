@@ -26,6 +26,7 @@ import socket
 import ast
 import pprint
 
+
 # Evaluation of globals happens in a thread with the pylab module imported.
 # Although we don't care about plotting, importing pylab makes Qt calls. We
 # can't have that from a non main thread, so we'll just disable matplotlib's
@@ -63,6 +64,7 @@ from zmq import ZMQError
 from labscript_utils.labconfig import LabConfig, config_prefix
 from labscript_utils.setup_logging import setup_logging
 import labscript_utils.shared_drive as shared_drive
+from SimplePythonEditor import SimplePythonEditor
 import runmanager
 
 from qtutils import inmain, inmain_decorator, UiLoader, inthread, DisconnectContextManager
@@ -148,6 +150,15 @@ class KeyPressQApplication(QtGui.QApplication):
             self.keyRelease.emit(event.key(), event.modifiers(), event.isAutoRepeat())
         return QtGui.QApplication.notify(self, object, event)
 
+
+class QPadSpinBox(QtGui.QSpinBox):
+    def __init__(self, *args):
+       QtGui.QSpinBox.__init__(self, *args)
+
+       self.setRange(0,9999)
+
+    def textFromValue(self, value):
+       return "%04d" % value
 
 class FingerTabBarWidget(QtGui.QTabBar):
 
@@ -1151,8 +1162,12 @@ class GroupTab(object):
 class RunmanagerMainWindow(QtGui.QMainWindow):
     # A signal to show that the window is shown and painted.
     firstPaint = Signal()
+    
     # A signal for when the window manager has created a new window for this widget:
     newWindow = Signal(int)
+
+    # A signal for when the send to editor button is pressed
+    edit_labscript = Signal(str)
 
     def __init__(self, *args, **kwargs):
         QtGui.QMainWindow.__init__(self, *args, **kwargs)
@@ -1176,7 +1191,6 @@ class RunmanagerMainWindow(QtGui.QMainWindow):
             self._previously_painted = True
             self.firstPaint.emit()
         return result
-
 
 class PoppedOutOutputBoxWindow(QtGui.QDialog):
     # A signal for when the window manager has created a new window for this widget:
@@ -1215,6 +1229,8 @@ class RunManager(object):
         loader = UiLoader()
         loader.registerCustomWidget(FingerTabWidget)
         loader.registerCustomWidget(TreeView)
+        loader.registerCustomWidget(SimplePythonEditor)
+        loader.registerCustomWidget(QPadSpinBox)
         self.ui = loader.load('main.ui', RunmanagerMainWindow())
 
         self.output_box = OutputBox(self.ui.verticalLayout_output_tab)
@@ -1225,8 +1241,8 @@ class RunManager(object):
         self.output_popout_button.setIcon(QtGui.QIcon(':/qtutils/fugue/arrow-out'))
         self.output_popout_button.setToolTip('Toggle whether the output box is in a separate window')
         self.ui.tabWidget.tabBar().setTabButton(output_tab_index, QtGui.QTabBar.RightSide, self.output_popout_button)
-        # Fix the first three tabs in place:
-        for index in range(3):
+        # Fix the first four tabs in place:
+        for index in range(4):
             self.ui.tabWidget.tabBar().setMovable(False, index=index)
         # Whether or not the output box is currently popped out:
         self.output_box_is_popped_out = False
@@ -1262,6 +1278,15 @@ class RunManager(object):
             self.output_folder_format = self.output_folder_format.strip(os.path.sep)
         except (LabConfig.NoOptionError, LabConfig.NoSectionError):
             self.output_folder_format = os.path.join('%Y', '%m', '%d')
+        
+        # What the output generate_sequence_id should look like
+        try:
+            self.sequence_id_format = self.exp_config.get('runmanager', 'sequence_id_format')
+            # Better not contain slashes:
+            self.sequence_id_format =  self.sequence_id_format.replace(os.path.sep,"")
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            self.sequence_id_format = '%Y%m%dT%H%M%S'
+            
         # Store the currently open groups as {(globals_filename, group_name): GroupTab}
         self.currently_open_groups = {}
 
@@ -1289,12 +1314,6 @@ class RunManager(object):
         self.compile_queue_thread = threading.Thread(target=self.compile_loop)
         self.compile_queue_thread.daemon = True
         self.compile_queue_thread.start()
-
-        # Another loop, for submitting to mise in a separate thread:
-        self.mise_submission_queue = Queue.Queue()
-        self.mise_submission_queue_thread = threading.Thread(target=self.mise_submission_loop)
-        self.mise_submission_queue_thread.daemon = True
-        self.mise_submission_queue_thread.start()
 
         # Start the compiler subprocess:
         self.to_child, self.from_child, self.child = zprocess.subprocess_with_queues(
@@ -1348,7 +1367,7 @@ class RunManager(object):
                                             ],
                                   }
         self.exp_config = LabConfig(config_path, required_config_params)
-
+    
     def setup_axes_tab(self):
         self.axes_model = QtGui.QStandardItemModel()
 
@@ -1430,24 +1449,37 @@ class RunManager(object):
         # The button that pops the output box in and out:
         self.output_popout_button.clicked.connect(self.on_output_popout_button_clicked)
 
-        # The menu items:
+        # File menu items
+
+        self.ui.actionNew_Labscript_file.triggered.connect(self.ui.script_SimplePythonEditor.on_new)
+        self.ui.actionOpen_Labscript_file.triggered.connect(self.ui.script_SimplePythonEditor.on_open)
+        self.ui.actionSave_current_Labscript_file.triggered.connect(self.ui.script_SimplePythonEditor.on_save)
+        self.ui.actionSave_current_Labscript_file_as.triggered.connect(self.ui.script_SimplePythonEditor.on_save_as)
         self.ui.actionLoad_configuration.triggered.connect(self.on_load_configuration_triggered)
         self.ui.actionRevert_configuration.triggered.connect(self.on_revert_configuration_triggered)
         self.ui.actionSave_configuration.triggered.connect(self.on_save_configuration_triggered)
         self.ui.actionSave_configuration_as.triggered.connect(self.on_save_configuration_as_triggered)
         self.ui.actionQuit.triggered.connect(self.ui.close)
 
+        # Edit menu items
+        self.ui.actionFind_replace.triggered.connect(self.ui.script_SimplePythonEditor.toggle_find_replace)
+        self.ui.actionFind_replace_next.triggered.connect(self.ui.script_SimplePythonEditor.on_find_replace)
+                
+        self.ui.actionGoto_line.triggered.connect(self.ui.script_SimplePythonEditor.toggle_goto_line)
+
         # labscript file and folder selection stuff:
         self.ui.toolButton_select_labscript_file.clicked.connect(self.on_select_labscript_file_clicked)
         self.ui.toolButton_select_shot_output_folder.clicked.connect(self.on_select_shot_output_folder_clicked)
-        self.ui.toolButton_edit_labscript_file.clicked.connect(self.on_edit_labscript_file_clicked)
         self.ui.toolButton_reset_shot_output_folder.clicked.connect(self.on_reset_shot_output_folder_clicked)
         self.ui.lineEdit_labscript_file.textChanged.connect(self.on_labscript_file_text_changed)
         self.ui.lineEdit_shot_output_folder.textChanged.connect(self.on_shot_output_folder_text_changed)
+        self.ui.edit_current_labscript_toolButton.clicked.connect(self.on_edit_current_labscript)
+        self.ui.edit_labscript.connect(self.ui.script_SimplePythonEditor.on_open_named)
 
-        # compile/send to mise toggling:
-        self.ui.radioButton_compile.toggled.connect(self.on_compile_toggled)
-        self.ui.radioButton_send_to_mise.toggled.connect(self.on_send_to_mise_toggled)
+        # Signals two and from the imbeded python editor
+        self.ui.script_SimplePythonEditor.filenameTrigger.connect(self.on_filenameTrigger)
+        # Override tooltip for filenameTrigger
+        self.ui.script_SimplePythonEditor.sendFilename_toolButton.setToolTip('Set as current Labscript file...')
 
         # Control buttons; engage, abort, restart subprocess:
         self.ui.pushButton_engage.clicked.connect(self.on_engage_clicked)
@@ -1491,6 +1523,22 @@ class RunManager(object):
         if os.name == 'nt':
             self.ui.newWindow.connect(set_win_appusermodel)
             self.output_box_window.newWindow.connect(set_win_appusermodel)
+
+    def on_edit_current_labscript(self, checked=True):
+        self.ui.edit_labscript.emit(self.ui.lineEdit_labscript_file.text())
+
+    def on_filenameTrigger(self, filename=''):
+
+        # Convert to standard platform specific path, otherwise Qt likes forward slashes:
+        filename = os.path.abspath(filename)
+        if not os.path.isfile(filename):
+            error_dialog("No such file %s." % filename)
+            return
+
+        # Write the file to the lineEdit:
+        self.ui.lineEdit_labscript_file.setText(filename)
+        # Tell the output folder thread that the output folder might need updating:
+        self.output_folder_update_required.set()
 
     def on_close_event(self):
         save_data = self.get_save_data()
@@ -1544,7 +1592,7 @@ class RunManager(object):
             self.output_box_window.show()
         self.output_box_is_popped_out = not self.output_box_is_popped_out
 
-    def on_select_labscript_file_clicked(self, checked):
+    def on_select_labscript_file_clicked(self, checked=True):
         labscript_file = QtGui.QFileDialog.getOpenFileName(self.ui,
                                                            'Select labscript file',
                                                            self.last_opened_labscript_folder,
@@ -1559,34 +1607,12 @@ class RunManager(object):
             return
         # Save the containing folder for use next time we open the dialog box:
         self.last_opened_labscript_folder = os.path.dirname(labscript_file)
+        
         # Write the file to the lineEdit:
         self.ui.lineEdit_labscript_file.setText(labscript_file)
         # Tell the output folder thread that the output folder might need updating:
         self.output_folder_update_required.set()
-
-    def on_edit_labscript_file_clicked(self, checked):
-        # get path to text editor
-        editor_path = self.exp_config.get('programs', 'text_editor')
-        editor_args = self.exp_config.get('programs', 'text_editor_arguments')
-        # Get the current labscript file:
-        current_labscript_file = self.ui.lineEdit_labscript_file.text()
-        # Ignore if no file selected
-        if not current_labscript_file:
-            return
-        if not editor_path:
-            error_dialog("No editor specified in the labconfig.")
-        if '{file}' in editor_args:
-            # Split the args on spaces into a list, replacing {file} with the labscript file
-            editor_args = [arg if arg != '{file}' else current_labscript_file for arg in editor_args.split()]
-        else:
-            # Otherwise if {file} isn't already in there, append it to the other args:
-            editor_args = [current_labscript_file] + editor_args.split()
-        try:
-            subprocess.Popen([editor_path] + editor_args)
-        except Exception as e:
-            error_dialog("Unable to launch text editor specified in %s. Error was: %s" %
-                         (self.exp_config.config_path, str(e)))
-
+        
     def on_select_shot_output_folder_clicked(self, checked):
         shot_output_folder = QtGui.QFileDialog.getExistingDirectory(self.ui,
                                                                     'Select shot output folder',
@@ -1617,15 +1643,12 @@ class RunManager(object):
         # within the next second):
         self.output_folder_update_required.set()
 
-    def on_labscript_file_text_changed(self, text):
-        # Blank out the 'edit labscript file' button if no labscript file is
-        # selected
-        enabled = bool(text)
-        self.ui.toolButton_edit_labscript_file.setEnabled(enabled)
+    def on_labscript_file_text_changed(self, filename):
+        enabled = bool(filename)
         # Blank out the 'select shot output folder' button if no labscript
         # file is selected:
         self.ui.toolButton_select_shot_output_folder.setEnabled(enabled)
-        self.ui.lineEdit_labscript_file.setToolTip(text)
+        self.ui.lineEdit_labscript_file.setToolTip(filename)
 
     def on_shot_output_folder_text_changed(self, text):
         # Blank out the 'reset default output folder' button if the user is
@@ -1637,23 +1660,9 @@ class RunManager(object):
         self.ui.toolButton_reset_shot_output_folder.setEnabled(enabled)
         self.ui.lineEdit_shot_output_folder.setToolTip(text)
 
-    def on_compile_toggled(self, checked):
-        if checked:
-            # Show the corresponding page of the stackedWidget:
-            page = self.ui.stackedWidgetPage_compile
-            self.ui.stackedWidget_compile_or_mise.setCurrentWidget(page)
-
-    def on_send_to_mise_toggled(self, checked):
-        if checked:
-            # Show the corresponding page of the stackedWidget:
-            page = self.ui.stackedWidgetPage_send_to_mise
-            self.ui.stackedWidget_compile_or_mise.setCurrentWidget(page)
-
     def on_engage_clicked(self):
         logger.info('Engage')
         try:
-            compile = self.ui.radioButton_compile.isChecked()
-            submit_to_mise = self.ui.radioButton_send_to_mise.isChecked()
             send_to_BLACS = self.ui.checkBox_run_shots.isChecked()
             send_to_runviewer = self.ui.checkBox_view_shots.isChecked()
             labscript_file = self.ui.lineEdit_labscript_file.text()
@@ -1664,26 +1673,22 @@ class RunManager(object):
             if not output_folder:
                 raise Exception('Error: No output folder selected')
             BLACS_host = self.ui.lineEdit_BLACS_hostname.text()
-            mise_host = self.ui.lineEdit_mise_hostname.text()
             logger.info('Parsing globals...')
             active_groups = self.get_active_groups()
             try:
                 sequenceglobals, shots, evaled_globals, global_hierarchy, expansions = self.parse_globals(active_groups)
             except Exception as e:
                 raise Exception('Error parsing globals:\n%s\nCompilation aborted.' % str(e))
-            if compile:
-                logger.info('Making h5 files')
-                labscript_file, run_files = self.make_h5_files(
-                    labscript_file, output_folder, sequenceglobals, shots, shuffle)
-                self.ui.pushButton_abort.setEnabled(True)
-                self.compile_queue.put([labscript_file, run_files, send_to_BLACS, BLACS_host, send_to_runviewer])
-            elif submit_to_mise:
-                if not mise_host:
-                    raise Exception('Error: No mise host entered')
-                self.mise_submission_queue.put(
-                    [mise_host, BLACS_host, labscript_file, sequenceglobals, shots, shuffle, output_folder])
-            else:
-                raise RuntimeError('neither radiobutton selected')  # Sanity check
+            logger.info('Making h5 files')
+                        
+            labscript_file, run_files = self.make_h5_files(
+                labscript_file, output_folder, sequenceglobals, shots, 
+                self.ui.plainTextEdit_SequenceNotes.toPlainText(),
+                shuffle)
+            self.ui.pushButton_abort.setEnabled(True)
+            self.compile_queue.put([labscript_file, run_files, send_to_BLACS, BLACS_host, send_to_runviewer])
+            if self.ui.increment_checkBox.isChecked():            
+                self.ui.spinBox_SequenceIndex.setValue(self.ui.spinBox_SequenceIndex.value() + 1)
         except Exception as e:
             self.output_box.output('%s\n\n' % str(e), red=True)
         logger.info('end engage')
@@ -2221,12 +2226,14 @@ class RunManager(object):
         folder, does not check if it exists."""
         current_day_folder_suffix = time.strftime(self.output_folder_format)
         current_labscript_file = self.ui.lineEdit_labscript_file.text()
+        current_sequence_index = self.ui.spinBox_SequenceIndex.value()
+        
         if not current_labscript_file:
             return ''
-        current_labscript_basename = os.path.splitext(os.path.basename(current_labscript_file))[0]
-        default_output_folder = os.path.join(self.experiment_shot_storage,
-                                             current_labscript_basename, current_day_folder_suffix)
-        default_output_folder = os.path.normpath(default_output_folder)
+        default_output_folder = runmanager.generate_output_folder(current_labscript_file, 
+                                                                  self.experiment_shot_storage, 
+                                                                  current_day_folder_suffix,
+                                                                  current_sequence_index)
         return default_output_folder
 
     def rollover_shot_output_folder(self):
@@ -2664,12 +2671,8 @@ class RunManager(object):
 
         # Get the server hostnames:
         BLACS_host = self.ui.lineEdit_BLACS_hostname.text()
-        mise_host = self.ui.lineEdit_mise_hostname.text()
 
         # Get other GUI settings:
-        compile = self.ui.radioButton_compile.isChecked()
-        submit_to_mise = self.ui.radioButton_send_to_mise.isChecked()
-        compile = self.ui.checkBox_run_shots.isChecked()
         send_to_runviewer = self.ui.checkBox_view_shots.isChecked()
         send_to_BLACS = self.ui.checkBox_run_shots.isChecked()
         shuffle = self.ui.pushButton_shuffle.isChecked()
@@ -2680,13 +2683,10 @@ class RunManager(object):
                      'current_labscript_file': current_labscript_file,
                      'shot_output_folder': shot_output_folder,
                      'is_using_default_shot_output_folder': is_using_default_shot_output_folder,
-                     'submit_to_mise': submit_to_mise,
-                     'compile': compile,
                      'send_to_runviewer': send_to_runviewer,
                      'send_to_BLACS': send_to_BLACS,
                      'shuffle': shuffle,
-                     'BLACS_host': BLACS_host,
-                     'mise_host': mise_host}
+                     'BLACS_host': BLACS_host}
         return save_data
 
     def save_configuration(self, save_file):
@@ -2814,20 +2814,6 @@ class RunManager(object):
                 self.ui.lineEdit_shot_output_folder.setText(default_output_folder)
                 self.last_selected_shot_output_folder = os.path.dirname(default_output_folder)
         try:
-            submit_to_mise = ast.literal_eval(runmanager_config.get('runmanager_state', 'submit_to_mise'))
-        except Exception:
-            pass
-        else:
-            if submit_to_mise:
-                self.ui.radioButton_send_to_mise.setChecked(True)
-        try:
-            compile = ast.literal_eval(runmanager_config.get('runmanager_state', 'compile'))
-        except Exception:
-            pass
-        else:
-            if compile:
-                self.ui.radioButton_compile.setChecked(True)
-        try:
             send_to_runviewer = ast.literal_eval(runmanager_config.get('runmanager_state', 'send_to_runviewer'))
         except Exception:
             pass
@@ -2852,12 +2838,6 @@ class RunManager(object):
             pass
         else:
             self.ui.lineEdit_BLACS_hostname.setText(BLACS_host)
-        try:
-            mise_host = ast.literal_eval(runmanager_config.get('runmanager_state', 'mise_host'))
-        except Exception:
-            pass
-        else:
-            self.ui.lineEdit_mise_hostname.setText(mise_host)
         # Set as self.last_save_data:
         save_data = self.get_save_data()
         self.last_save_data = save_data
@@ -3048,10 +3028,17 @@ class RunManager(object):
 
         return expansion_types_changed
 
-    def make_h5_files(self, labscript_file, output_folder, sequence_globals, shots, shuffle):
+    def make_h5_files(self, labscript_file, output_folder, sequence_globals, shots, notes, shuffle):
         mkdir_p(output_folder)  # ensure it exists
-        sequence_id = runmanager.generate_sequence_id(labscript_file)
-        run_files = runmanager.make_run_files(output_folder, sequence_globals, shots, sequence_id, shuffle)
+        
+        # Create notes text file
+        notes_file = os.path.join(output_folder, "notes.txt")
+        with open(notes_file, 'w') as f:
+            f.write(notes)
+        
+        sequence_id = runmanager.generate_sequence_id(labscript_file, self.sequence_id_format)
+        sequence_index = self.ui.spinBox_SequenceIndex.value()
+        run_files = runmanager.make_run_files(output_folder, sequence_globals, shots, sequence_id, sequence_index, notes, shuffle)
         logger.debug(run_files)
         return labscript_file, run_files
 
@@ -3105,28 +3092,6 @@ class RunManager(object):
         except Exception as e:
             self.output_box.output('Couldn\'t submit shot to runviewer: %s\n\n' % str(e), red=True)
 
-    def mise_submission_loop(self):
-        mise_port = int(self.exp_config.get('ports', 'mise'))
-        BLACS_port = int(self.exp_config.get('ports', 'BLACS'))
-        while True:
-            try:
-                mise_host, BLACS_host, labscript_file, sequenceglobals, shots, shuffle, output_folder = \
-                    self.mise_submission_queue.get()
-                self.output_box.output('submitting labscript and parameter space to mise\n')
-                data = ('from runmanager', labscript_file, sequenceglobals, shots,
-                        output_folder, shuffle, BLACS_host, BLACS_port, self.shared_drive_prefix)
-                try:
-                    success, message = zprocess.zmq_get(mise_port, host=mise_host, data=data, timeout=2)
-                except ZMQError as e:
-                    success, message = False, 'Could not send to mise: %s\n\n' % str(e)
-                self.output_box.output(message, red=not success)
-                if success:
-                    self.output_box.output('Ready.\n\n')
-            except Exception:
-                # Raise it so whatever bug it is gets seen, but keep going so the thread keeps functioning:
-                exc_info = sys.exc_info()
-                zprocess.raise_exception_in_thread(exc_info)
-                continue
 
 if __name__ == "__main__":
     logger = setup_logging('runmanager')
