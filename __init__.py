@@ -22,6 +22,8 @@ import types
 import threading
 import traceback
 
+from collections import OrderedDict
+
 import labscript_utils.h5_lock
 import h5py
 import numpy as np
@@ -149,9 +151,16 @@ def delete_group(filename, groupname):
         del f['globals'][groupname]
 
 
-def get_globalslist(filename, groupname):
+def get_globalslist(filename, groupname=None):
+    """
+    Get a dictionary of the globals.  if groupname is None we will get all the
+    globals
+    """
     with h5py.File(filename, 'r') as f:
-        group = f['globals'][groupname]
+        if groupname is None:
+            group = f['globals']
+        else:
+            group = f['globals'][groupname]
         # File closes after this function call, so have to convert
         # the attrs to a dict before its file gets dereferenced:
         return dict(group.attrs)
@@ -490,16 +499,27 @@ def expand_globals(sequence_globals, evaled_globals):
         shots.append(shot_globals)
     return shots
 
+def generate_output_folder(current_labscript_file, 
+                           experiment_shot_storage, 
+                           current_day_folder_suffix,
+                           current_sequence_index):
+    current_labscript_basename = os.path.splitext(os.path.basename(current_labscript_file))[0]
+    default_output_folder = os.path.join(experiment_shot_storage,
+                                         current_labscript_basename, 
+                                         current_day_folder_suffix,
+                                         "%04d"%current_sequence_index)
+    default_output_folder = os.path.normpath(default_output_folder)
+    return default_output_folder
 
-def generate_sequence_id(scriptname):
+def generate_sequence_id(scriptname, sequence_id_format):
     """Our convention for generating sequence ids. Just a timestamp and
     the name of the labscript that the run file is to be compiled with."""
-    timestamp = time.strftime('%Y%m%dT%H%M%S', time.localtime())
+    
+    timestamp = time.strftime(sequence_id_format, time.localtime())
     scriptbase = os.path.basename(scriptname).split('.py')[0]
     return timestamp + '_' + scriptbase
 
-
-def make_run_files(output_folder, sequence_globals, shots, sequence_id, shuffle=False):
+def make_run_files(output_folder, sequence_globals, shots, sequence_id, sequence_index, notes, shuffle=False):
     """Does what it says. sequence_globals and shots are of the datatypes
     returned by get_globals and get_shots, one is a nested dictionary with
     string values, and the other a flat dictionary. sequence_id should
@@ -520,12 +540,11 @@ def make_run_files(output_folder, sequence_globals, shots, sequence_id, shuffle=
         random.shuffle(shots)
     for i, shot_globals in enumerate(shots):
         runfilename = ('%s_%0' + str(ndigits) + 'd.h5') % (basename, i)
-        make_single_run_file(runfilename, sequence_globals, shot_globals, sequence_id, i, nruns)
+        make_single_run_file(runfilename, sequence_globals, shot_globals, sequence_id, sequence_index, notes, i, nruns)
         yield runfilename
 
-
-def make_single_run_file(filename, sequenceglobals, runglobals, sequence_id, run_no, n_runs):
-    """Does what it says. runglobals is a dict of this run's globals,
+def make_single_run_file(filename, sequenceglobals, shot_globals, sequence_id, sequence_index, notes, run_no, n_runs):
+    """Does what it says. shot_globals is a dict of this run's globals,
     the format being the same as that of one element of the list returned
     by expand_globals.  sequence_globals is a nested dictionary of the
     type returned by get_globals. Every run file needs a sequence ID,
@@ -535,35 +554,26 @@ def make_single_run_file(filename, sequenceglobals, runglobals, sequence_id, run
     must be provided, if this run file is part of a sequence, then they
     should reflect how many run files are being generated which share
     this sequence_id."""
-    with h5py.File(filename, 'w') as f:
-        f.attrs['sequence_id'] = sequence_id
-        f.attrs['run number'] = run_no
-        f.attrs['n_runs'] = n_runs
-        f.create_group('globals')
+    with h5py.File(filename, 'w') as h5file:
+        h5file.attrs['sequence_id'] = sequence_id
+        h5file.attrs['sequence_index'] = sequence_index
+        h5file.attrs['run number'] = run_no
+        h5file.attrs['n_runs'] = n_runs
+        h5file.attrs['notes'] = notes
+        h5file.create_group('globals')
         if sequenceglobals is not None:
             for groupname, groupvars in sequenceglobals.items():
-                group = f['globals'].create_group(groupname)
+                group = h5file['globals'].create_group(groupname)
                 unitsgroup = group.create_group('units')
                 expansiongroup = group.create_group('expansion')
                 for name, (value, units, expansion) in groupvars.items():
                     group.attrs[name] = value
                     unitsgroup.attrs[name] = units
                     expansiongroup.attrs[name] = expansion
-        for name, value in runglobals.items():
-            if value is None:
-                # Store it as a null object reference:
-                value = h5py.Reference()
-            try:
-                f['globals'].attrs[name] = value
-            except Exception as e:
-                message = ('Global %s cannot be saved as an hdf5 attribute. ' % name +
-                           'Globals can only have relatively simple datatypes, with no nested structures. ' +
-                           'Original error was:\n' +
-                           '%s: %s' % (e.__class__.__name__, e.message))
-                raise ValueError(message)
+        set_shot_globals(h5file, shot_globals)
 
 
-def make_run_file_from_globals_files(labscript_file, globals_files, output_path):
+def make_run_file_from_globals_files(labscript_file, globals_files, output_path, sequence_id_format, notes):
     """Creates a run file output_path, using all the globals from
     globals_files. Uses labscript_file only to generate a sequence ID"""
     groups = get_all_groups(globals_files)
@@ -577,8 +587,8 @@ def make_run_file_from_globals_files(labscript_file, globals_files, output_path)
                 scanning_globals.append(global_name)
         raise ValueError('Cannot compile to a single run file: The following globals are a sequence: ' +
                          ' '.join(scanning_globals))
-    sequence_id = generate_sequence_id(labscript_file)
-    make_single_run_file(output_path, sequence_globals, shots[0], sequence_id, 1, 1)
+    sequence_id = generate_sequence_id(labscript_file, sequence_id_format)
+    make_single_run_file(output_path, sequence_globals, shots[0], sequence_id, 0, notes, 1, 1)
 
 
 def compile_labscript(labscript_file, run_file):
@@ -649,7 +659,7 @@ def compile_multishot_async(labscript_file, run_files, stream_port, done_callbac
     child.communicate()
 
 
-def compile_labscript_with_globals_files_async(labscript_file, globals_files, output_path, stream_port, done_callback):
+def compile_labscript_with_globals_files_async(labscript_file, globals_files, output_path, sequence_id_format, notes, stream_port, done_callback):
     """Same as compile_labscript_with_globals_files, except it launches
     a thread to do the work and does not return anything. Instead,
     stderr and stdout will be put to stream_port via zmq push in
@@ -657,7 +667,7 @@ def compile_labscript_with_globals_files_async(labscript_file, globals_files, ou
     compilation is finished, the function done_callback will be called
     a boolean argument indicating success or failure."""
     try:
-        make_run_file_from_globals_files(labscript_file, globals_files, output_path)
+        make_run_file_from_globals_files(labscript_file, globals_files, output_path, sequence_id_format, notes)
         thread = threading.Thread(
             target=compile_labscript_async, args=[labscript_file, output_path, stream_port, done_callback])
         thread.daemon = True
@@ -689,6 +699,24 @@ def get_shot_globals(filepath):
                 value = str(value)
             params[name] = value
     return params
+
+def set_shot_globals(h5file, shot_globals):
+    """
+    Writes the shot globals into an already open h5 file
+    """
+    for name, value in shot_globals.items():
+        if value is None:
+            # Store it as a null object reference:
+            value = h5py.Reference()
+        try:
+            h5file['globals'].attrs[name] = value
+        except Exception as e:
+            message = ('Global %s cannot be saved as an hdf5 attribute. ' % name +
+                       'Globals can only have relatively simple datatypes, with no nested structures. ' +
+                       'Original error was:\n' +
+                       '%s: %s' % (e.__class__.__name__, e.message))
+            raise ValueError(message)
+
 
 
 def dict_diff(dict1, dict2):
